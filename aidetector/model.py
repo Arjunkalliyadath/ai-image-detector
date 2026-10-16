@@ -6,6 +6,7 @@ from typing import Iterable, Protocol, Sequence
 
 from PIL import Image, ImageOps
 
+from .checkpoint_utils import load_torch_checkpoint
 from .config import (
     DEFAULT_BACKEND,
     DEFAULT_HF_MODEL_ID,
@@ -56,13 +57,6 @@ def _select_device(torch_module, requested: str | None) -> str:
 
 def _normalise_image(image: Image.Image) -> Image.Image:
     return ImageOps.exif_transpose(image).convert("RGB")
-
-
-def _load_torch_checkpoint(torch_module, weight_path: str | Path):
-    try:
-        return torch_module.load(str(weight_path), map_location="cpu", weights_only=True)
-    except TypeError:
-        return torch_module.load(str(weight_path), map_location="cpu")
 
 
 def _build_detection_result(
@@ -142,7 +136,7 @@ class AIImageDetector:
                 filename=FC_WEIGHT_PATH_IN_REPO,
             )
 
-        state = _load_torch_checkpoint(self._torch, weight_path)
+        state = load_torch_checkpoint(self._torch, weight_path)
         if isinstance(state, dict) and "state_dict" in state:
             state = state["state_dict"]
 

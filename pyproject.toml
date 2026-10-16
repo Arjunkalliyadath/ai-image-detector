@@ -33,10 +33,13 @@ web = ["gradio>=4.31"]
 dev = ["pytest>=8.0", "ruff>=0.4"]
 
 [project.scripts]
-aidetect = "aidetector.cli:app"
+aidetect = "aidetector.cli:main"
 
 [tool.ruff]
 line-length = 100
 
 [tool.hatch.build.targets.wheel]
 packages = ["aidetector"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

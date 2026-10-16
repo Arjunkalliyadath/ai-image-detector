@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+
+import pytest
 from pathlib import Path
 
 from PIL import Image
 from typer.testing import CliRunner
 
+from aidetector import cli
+from aidetector.checkpoint_utils import SafeCheckpointLoadError
 from aidetector.cli import app
 from aidetector.evaluation import ImageSample
 from aidetector.types import DetectionResult
@@ -130,3 +134,60 @@ def test_benchmark_tiny_genimage_local_writes_group_report(monkeypatch, tmp_path
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["groups"]["generator"]["SD14"]["accuracy"] == 1.0
     assert payload["dataset"]["kind"] == "tiny-genimage-local"
+
+def test_calibrated_ultra_preserves_zero_weight_and_threshold(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "aidetector.cli.create_detector",
+        lambda *args, **kwargs: BrightnessDetector(),
+    )
+    monkeypatch.setattr(
+        "aidetector.cli.search_blend_weight_threshold",
+        lambda *args, **kwargs: {
+            "primary_weight": 0.0,
+            "threshold": 0.0,
+            "accuracy": 0.0,
+            "balanced_accuracy": 0.0,
+            "f1": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+        },
+    )
+
+    (tmp_path / "real").mkdir()
+    (tmp_path / "ai").mkdir()
+    Image.new("RGB", (8, 8), "black").save(tmp_path / "real" / "real-1.png")
+    Image.new("RGB", (8, 8), "gray").save(tmp_path / "real" / "real-2.png")
+    Image.new("RGB", (8, 8), "white").save(tmp_path / "ai" / "fake-1.png")
+    Image.new("RGB", (8, 8), "red").save(tmp_path / "ai" / "fake-2.png")
+    output = tmp_path / "zero-values-report.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark-calibrated-folder",
+            str(tmp_path),
+            "--backend",
+            "ultra",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["model"]["selected_primary_weight"] == 0.0
+    assert payload["model"]["selected_threshold"] == 0.0
+    assert payload["test"]["metrics"]["threshold"] == 0.0
+
+
+def test_main_handles_safe_checkpoint_error(monkeypatch, capsys):
+    def fail_app():
+        raise SafeCheckpointLoadError("blocked checkpoint for test")
+
+    monkeypatch.setattr(cli, "app", fail_app)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 1
+    assert "blocked checkpoint for test" in capsys.readouterr().out

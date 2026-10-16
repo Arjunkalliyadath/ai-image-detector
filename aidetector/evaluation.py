@@ -469,12 +469,7 @@ def search_threshold(
             recall=recall,
             f1=f1,
         )
-        incumbent = (
-            float(best["balanced_accuracy"] or -1.0),
-            float(best["accuracy"] or -1.0),
-            float(best["f1"] or -1.0),
-            -1.0,
-        ) if objective == "balanced_accuracy" and min_recall is None else best.get("_candidate", (-1.0, -1.0, -1.0, -1.0))
+        incumbent = best.get("_candidate", (-1.0, -1.0, -1.0, -1.0))
         if candidate > incumbent:
             best = {
                 "threshold": threshold,
@@ -525,18 +520,13 @@ def search_blend_weight_threshold(
         )
         candidate = _objective_tuple(
             objective=objective,
-            accuracy=float(threshold_metrics["accuracy"] or -1.0),
-            balanced_accuracy=float(threshold_metrics["balanced_accuracy"] or -1.0),
-            precision=float(threshold_metrics.get("precision") or -1.0),
-            recall=float(threshold_metrics.get("recall") or -1.0),
-            f1=float(threshold_metrics["f1"] or -1.0),
+            accuracy=float(threshold_metrics["accuracy"] if threshold_metrics["accuracy"] is not None else -1.0),
+            balanced_accuracy=float(threshold_metrics["balanced_accuracy"] if threshold_metrics["balanced_accuracy"] is not None else -1.0),
+            precision=float(threshold_metrics["precision"] if threshold_metrics.get("precision") is not None else -1.0),
+            recall=float(threshold_metrics["recall"] if threshold_metrics.get("recall") is not None else -1.0),
+            f1=float(threshold_metrics["f1"] if threshold_metrics["f1"] is not None else -1.0),
         )
-        incumbent = (
-            float(best["balanced_accuracy"] or -1.0),
-            float(best["accuracy"] or -1.0),
-            float(best["f1"] or -1.0),
-            -1.0,
-        ) if objective == "balanced_accuracy" and min_recall is None else best.get("_candidate", (-1.0, -1.0, -1.0, -1.0))
+        incumbent = best.get("_candidate", (-1.0, -1.0, -1.0, -1.0))
         if candidate > incumbent:
             best = {
                 "primary_weight": alpha,

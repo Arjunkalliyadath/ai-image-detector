@@ -11,6 +11,7 @@ from rich.console import Console
 from rich.table import Table
 from tqdm import tqdm
 
+from .checkpoint_utils import SafeCheckpointLoadError
 from .config import (
         DEFAULT_BACKEND,
         DEFAULT_HF_MODEL_ID,
@@ -803,8 +804,8 @@ def _run_calibrated_folder_benchmark(
             objective=optimize_metric,
             min_recall=min_recall,
         )
-        selected_weight = float(search["primary_weight"] or ultra_primary_weight)
-        selected_threshold = float(search["threshold"] or threshold)
+        selected_weight = float(search["primary_weight"] if search["primary_weight"] is not None else ultra_primary_weight)
+        selected_threshold = float(search["threshold"] if search["threshold"] is not None else threshold)
         calibration_scores = combine_scores(
             calibration_primary.y_score,
             calibration_secondary.y_score,
@@ -891,8 +892,8 @@ def _run_calibrated_folder_benchmark(
             objective=optimize_metric,
             min_recall=min_recall,
         )
-        selected_weight = float(search["primary_weight"] or hybrid_plus_primary_weight)
-        selected_threshold = float(search["threshold"] or threshold)
+        selected_weight = float(search["primary_weight"] if search["primary_weight"] is not None else hybrid_plus_primary_weight)
+        selected_threshold = float(search["threshold"] if search["threshold"] is not None else threshold)
         calibration_scores = combine_scores(
             calibration_primary.y_score,
             calibration_secondary.y_score,
@@ -977,8 +978,8 @@ def _run_calibrated_folder_benchmark(
             objective=optimize_metric,
             min_recall=min_recall,
         )
-        selected_weight = float(search["univfd_weight"] or hybrid_univfd_weight)
-        selected_threshold = float(search["threshold"] or threshold)
+        selected_weight = float(search["univfd_weight"] if search["univfd_weight"] is not None else hybrid_univfd_weight)
+        selected_threshold = float(search["threshold"] if search["threshold"] is not None else threshold)
         calibration_scores = combine_scores(
             calibration_univfd.y_score,
             calibration_hf.y_score,
@@ -1050,7 +1051,7 @@ def _run_calibrated_folder_benchmark(
             objective=optimize_metric,
             min_recall=min_recall,
         )
-        selected_threshold = float(search["threshold"] or threshold)
+        selected_threshold = float(search["threshold"] if search["threshold"] is not None else threshold)
         test_run = collect_predictions(detector, test_samples, batch_size=batch_size)
         calibration_metrics = compute_metrics(
             calibration_run.y_true,
@@ -1191,5 +1192,13 @@ def _validate_optimize_metric(value: str) -> None:
         )
 
 
+def main() -> None:
+    try:
+        app()
+    except SafeCheckpointLoadError as exc:
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        raise SystemExit(1) from None
+
+
 if __name__ == "__main__":
-    app()
+    main()

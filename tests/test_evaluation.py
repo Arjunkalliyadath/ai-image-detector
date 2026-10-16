@@ -202,3 +202,18 @@ def test_search_threshold_supports_f1_objective():
 
     assert result["threshold"] in {0.6, 0.7}
     assert result["f1"] == 1.0
+
+def test_hybrid_search_can_select_zero_primary_weight():
+    y_true = [0, 0, 1, 1]
+    primary_scores = [0.9, 0.8, 0.2, 0.1]
+    secondary_scores = [0.1, 0.2, 0.8, 0.9]
+
+    result = search_hybrid_weight_threshold(
+        y_true,
+        primary_scores,
+        secondary_scores,
+        alpha_step=0.25,
+    )
+
+    assert result["univfd_weight"] == 0.0
+    assert result["threshold"] == 0.8

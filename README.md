@@ -25,8 +25,7 @@ This repo also ships **hybrid**, **nonescape-mini**, **sentry-convnext-small**,
 lightweight Hugging Face classifier, `nonescape-mini` and
 `sentry-convnext-small` adapt external open-source detectors, `hybrid-plus`
 ensembles our internal hybrid with Nonescape, and `ultra` adds Sentry on top.
-This has become the strongest practical route so far without training a new
-model from scratch.
+These additional backends are experimental. Performance depends on the dataset, and checkpoint compatibility must be verified before use.
 
 The benchmark commands also support post-hoc threshold calibration objectives
 such as `balanced_accuracy` and `f1`. In practice, this has been one of the most
@@ -91,22 +90,18 @@ aidetect detect ./images --json
 ### Which Backend Should I Use?
 
 - `univfd`: simplest default, smallest moving parts, good baseline.
-- `sentry-convnext-small`: strong single external detector.
-- `ultra`: strongest current ensemble in this repo; best first choice when you want the highest practical accuracy.
+- `sentry-convnext-small`: experimental; the currently cached checkpoint is rejected by PyTorch's safe weights-only loader.
+- `ultra`: experimental ensemble that depends on Sentry; current checkpoint compatibility is unresolved.
 - `nonescape-mini`: useful extra signal and part of the stronger ensembles.
 - `hf`: generic Transformers image-classification path for standard Hugging Face checkpoints.
 
-If you only want one recommendation:
+For a backend we've verified initializes with the currently cached weights, start with UnivFD as a baseline. This does not imply high accuracy; our sample tests show it can miss AI-generated images:
 
 ```bash
-aidetect detect image.jpg --backend ultra
+aidetect detect image.jpg --backend univfd
 ```
 
-If you want a simpler but still strong single model:
-
-```bash
-aidetect detect image.jpg --backend sentry-convnext-small
-```
+`sentry-convnext-small` is not currently recommended with the cached checkpoint: PyTorch's safe loader rejects its serialized contents. Do not bypass this protection with unrestricted pickle loading. Use a verified compatible checkpoint or another backend.
 
 Use a Hugging Face image-classification model instead of UnivFD:
 
@@ -130,18 +125,14 @@ Use the external Nonescape Mini adapter directly:
 aidetect detect image.jpg --backend nonescape-mini
 ```
 
-Use the strongest current ensemble:
-
-```bash
-aidetect detect image.jpg --backend ultra
-```
+The Ultra ensemble currently depends on the Sentry checkpoint, whose safe-loading compatibility is unresolved. Do not rely on this command until a compatible checkpoint has been verified.
 
 ### How To Read The Output
 
-- `probability_ai` is the model's estimated likelihood that the image is AI-generated.
+- `probability_ai` is the detector's AI score, between 0 and 1. Unless separately calibrated and validated, do not interpret it as a reliable real-world probability.
 - `label` is the thresholded decision. By default, `probability_ai >= 0.5` becomes `ai`.
 - Treat borderline scores such as `0.45` to `0.55` as weak evidence, not proof.
-- If a decision matters, compare at least two backends, especially `sentry-convnext-small` and `ultra`.
+- If a decision matters, compare backends that successfully initialize with verified weights. Agreement between detectors is not proof that an image is real or AI-generated.
 
 ## Python API
 
@@ -272,7 +263,7 @@ Accuracy on this sample: `2 / 3 = 0.667`.
 
 What this tells us:
 
-- `ultra` is still the best default recommendation overall because it has the strongest larger-sample benchmark evidence in this repo.
+- The larger-sample benchmark results below are historical results from an earlier configuration. The currently cached Sentry checkpoint is rejected by PyTorch's safe weights-only loader, so those results do not establish that Sentry or Ultra can run with the current setup.
 - On this tiny 3-image test, `sentry-convnext-small` and `ultra` behaved almost the same.
 - `ai_retouched.png` is the hard case in this sample. Multiple backends treated it more like a human-edited image than a fully synthetic one.
 - `human.jpeg` is a good reminder that some detectors can overfire on real images. Here, `hf` and `nonescape-mini` both produced false positives.

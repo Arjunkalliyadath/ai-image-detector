@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import pytest
 from PIL import Image
 
+from aidetector.checkpoint_utils import load_torch_checkpoint
 from aidetector.model import iter_images
+
 from aidetector.sentry_adapter import convert_sentry_convnext_state_dict
 from aidetector.types import DetectionResult, EvaluationMetrics
 
@@ -77,3 +80,61 @@ def test_convert_sentry_convnext_state_dict_maps_keys():
     assert converted["stages.0.blocks.0.conv_dw.weight"] == "b"
     assert converted["stages.0.blocks.0.mlp.fc1.weight"] == "c"
     assert converted["head.fc.weight"] == "d"
+
+
+def test_load_torch_checkpoint_requests_weights_only(tmp_path):
+    class TorchStub:
+        def __init__(self):
+            self.calls = []
+
+        def load(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return {"state_dict": {"example": "tensor"}}
+
+    torch_stub = TorchStub()
+    weight_path = tmp_path / "weights.pth"
+
+    result = load_torch_checkpoint(torch_stub, weight_path)
+
+    assert result == {"state_dict": {"example": "tensor"}}
+    assert len(torch_stub.calls) == 1
+    args, kwargs = torch_stub.calls[0]
+    assert args == (str(weight_path),)
+    assert kwargs == {"map_location": "cpu", "weights_only": True}
+
+
+def test_load_torch_checkpoint_fails_closed_if_safe_loading_unsupported(tmp_path):
+    class TorchStub:
+        def __init__(self):
+            self.calls = []
+
+        def load(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            raise TypeError("unexpected keyword argument 'weights_only'")
+
+    torch_stub = TorchStub()
+
+    with pytest.raises(RuntimeError, match="Safe checkpoint loading"):
+        load_torch_checkpoint(torch_stub, tmp_path / "weights.pth")
+
+    assert len(torch_stub.calls) == 1
+    assert torch_stub.calls[0][1]["weights_only"] is True
+
+def test_load_torch_checkpoint_does_not_retry_after_rejection(tmp_path):
+    import pickle
+
+    class TorchStub:
+        def __init__(self):
+            self.calls = []
+
+        def load(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            raise pickle.UnpicklingError("blocked unsupported global")
+
+    torch_stub = TorchStub()
+
+    with pytest.raises(RuntimeError, match="safe weights-only loader"):
+        load_torch_checkpoint(torch_stub, tmp_path / "checkpoint.pth")
+
+    assert len(torch_stub.calls) == 1
+    assert torch_stub.calls[0][1]["weights_only"] is True

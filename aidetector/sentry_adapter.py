@@ -5,6 +5,7 @@ from typing import Sequence
 
 from PIL import Image
 
+from .checkpoint_utils import load_torch_checkpoint
 from .config import SENTRY_CONVNEXT_SMALL_CONFIG, SENTRY_CONVNEXT_SMALL_FILE, SENTRY_REPO_ID
 from .types import DetectionResult
 
@@ -44,7 +45,7 @@ class SentryConvNeXtDetector:
         self.weight_file = Path(weight_path)
         self.config_file = hf_hub_download(SENTRY_REPO_ID, SENTRY_CONVNEXT_SMALL_CONFIG)
         self.model = timm.create_model("convnext_small", pretrained=False, num_classes=2)
-        checkpoint = torch.load(str(self.weight_file), map_location="cpu", weights_only=False)
+        checkpoint = load_torch_checkpoint(torch, self.weight_file)
         state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
         converted = convert_sentry_convnext_state_dict(state_dict)
         missing, unexpected = self.model.load_state_dict(converted, strict=False)
