@@ -398,6 +398,62 @@ for `f1`. That materially improves overall balance and lifts weak generators,
 though performance is still generator-dependent and far from a universal
 guarantee.
 
+### Frozen OR ensemble on Tiny-GenImage (exploratory)
+
+An offline two-model OR ensemble was evaluated using the saved Nonescape Mini
+and UnivFD prediction reports. An image is flagged as AI-like when either
+model's `probability_ai` score reaches its configured threshold.
+
+Thresholds were selected using the calibration split from shard 0 and then
+held fixed for the test splits from shards 1, 2, and 3.
+
+| Setting | Nonescape threshold | UnivFD threshold |
+| --- | ---: | ---: |
+| Conservative | 0.904735 | 0.422590 |
+| Higher recall | 0.615721 | 0.422590 |
+
+Pooled results across the three held-out test splits:
+
+| Metric | Conservative | Higher recall |
+| --- | ---: | ---: |
+| Test images | 2,622 | 2,622 |
+| Accuracy | 76.89% | 82.15% |
+| Precision | 89.30% | 85.10% |
+| AI recall | 61.10% | 77.96% |
+| F1 | 0.726 | 0.814 |
+| False-positive rate | 7.32% | 13.65% |
+| True negatives | 1,215 | 1,132 |
+| False positives | 96 | 179 |
+| False negatives | 510 | 289 |
+| True positives | 801 | 1,022 |
+
+AI-generator recall on the pooled test splits:
+
+| Generator | Test images | Conservative recall | Higher-recall mode |
+| --- | ---: | ---: | ---: |
+| ADM | 172 | 62.8% | 69.2% |
+| BigGAN | 212 | 92.9% | 97.6% |
+| GLIDE | 181 | 60.8% | 84.5% |
+| Midjourney | 189 | 44.4% | 75.1% |
+| Stable Diffusion 1.5 (SD15) | 181 | 37.0% | 65.7% |
+| VQDM | 191 | 85.3% | 86.4% |
+| Wukong | 185 | 38.9% | 63.2% |
+
+Interpretation and limitations:
+
+- Conservative mode produces fewer false positives but misses more AI images.
+  Higher-recall mode catches more AI images at the cost of more false alarms.
+- Thresholds were not retuned on shards 1-3. The observed false-positive rates
+  are not guaranteed operating rates for future images.
+- The pooled test data is balanced: 1,311 real and 1,311 AI-generated images.
+  Precision will vary with the prevalence of AI-generated images in actual use.
+- These are internal experiments on different shards of the same dataset, not
+  independent external validation or proof of real-world scam-detection ability.
+- Performance varies substantially by generator. The results should be treated
+  as evidence, not proof of authenticity or synthetic origin.
+- The OR ensemble was calculated offline from saved per-model reports. It has
+  not yet been implemented as a selectable CLI or UI mode.
+
 ## Model Weights
 
 On first use, the UnivFD backend downloads:
