@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -12,17 +13,31 @@ class DetectionResult:
     confidence: float
     raw_score: float
     backend: str = "univfd"
+    details: dict[str, Any] | None = field(default=None, hash=False)
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        probability_ai = round(self.probability_ai, 6)
+        if (
+            self.label == "real"
+            and self.probability_ai < 0.5
+            and probability_ai >= 0.5
+        ):
+            # Prevent serialization rounding from contradicting the label.
+            probability_ai = self.probability_ai
+
+        payload = {
             "path": str(self.path) if self.path else None,
             "label": self.label,
-            "probability_ai": round(self.probability_ai, 6),
+            "probability_ai": probability_ai,
             "probability_real": round(self.probability_real, 6),
             "confidence": round(self.confidence, 6),
             "raw_score": round(self.raw_score, 6),
             "backend": self.backend,
         }
+        if self.details is not None:
+            payload["details"] = deepcopy(self.details)
+        return payload
+
 
 
 @dataclass(frozen=True)

@@ -1,11 +1,16 @@
+
 from __future__ import annotations
 
 import pytest
 from PIL import Image
 
 from aidetector.checkpoint_utils import load_torch_checkpoint
-from aidetector.model import iter_images
-
+from aidetector.model import (
+    HuggingFaceImageDetector,
+    _build_fallback_image_processor,
+    _resolve_local_hf_snapshot,
+    iter_images,
+)
 from aidetector.sentry_adapter import convert_sentry_convnext_state_dict
 from aidetector.types import DetectionResult, EvaluationMetrics
 
@@ -120,6 +125,7 @@ def test_load_torch_checkpoint_fails_closed_if_safe_loading_unsupported(tmp_path
     assert len(torch_stub.calls) == 1
     assert torch_stub.calls[0][1]["weights_only"] is True
 
+
 def test_load_torch_checkpoint_does_not_retry_after_rejection(tmp_path):
     import pickle
 
@@ -138,3 +144,193 @@ def test_load_torch_checkpoint_does_not_retry_after_rejection(tmp_path):
 
     assert len(torch_stub.calls) == 1
     assert torch_stub.calls[0][1]["weights_only"] is True
+
+
+def test_detection_result_real_label_survives_serialization_rounding():
+    result = DetectionResult(
+        path=None,
+        label="real",
+        probability_ai=0.4999996,
+        probability_real=0.5000004,
+        confidence=0.5000004,
+        raw_score=0.4999996,
+        backend="or-ensemble",
+        details={"score_semantics": "composite evidence score"},
+    )
+
+    payload = result.as_dict()
+
+    assert payload["label"] == "real"
+    assert payload["probability_ai"] < 0.5
+
+
+def test_detection_result_as_dict_copies_nested_details():
+    result = DetectionResult(
+        path=None,
+        label="ai",
+        probability_ai=0.8,
+        probability_real=0.2,
+        confidence=0.8,
+        raw_score=0.8,
+        details={"components": {"univfd": {"threshold": 0.42259}}},
+    )
+
+    payload = result.as_dict()
+    payload["details"]["components"]["univfd"]["threshold"] = 0.9
+
+    assert result.details["components"]["univfd"]["threshold"] == 0.42259
+
+
+def test_detection_result_is_hashable_with_details():
+    result = DetectionResult(
+        path=None,
+        label="ai",
+        probability_ai=0.8,
+        probability_real=0.2,
+        confidence=0.8,
+        raw_score=0.8,
+        details={"mode": "conservative"},
+    )
+
+    assert isinstance(hash(result), int)
+
+
+def _create_hf_cache(tmp_path, model_id="example/model"):
+    hub_dir = tmp_path / "hub" / f"models--{model_id.replace('/', '--')}"
+    snapshots_dir = hub_dir / "snapshots"
+    snapshots_dir.mkdir(parents=True)
+
+    return hub_dir, snapshots_dir
+
+
+def test_resolve_local_hf_snapshot_uses_valid_main_reference(
+    tmp_path, monkeypatch
+):
+    hub_dir, snapshots_dir = _create_hf_cache(tmp_path)
+    snapshot_dir = snapshots_dir / "revision-b"
+    snapshot_dir.mkdir()
+    (hub_dir / "refs").mkdir()
+    (hub_dir / "refs" / "main").write_text(
+        "revision-b", encoding="utf-8"
+    )
+
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "aidetector.model.Path.home", lambda: tmp_path / "no-home-cache"
+    )
+
+    result = _resolve_local_hf_snapshot("example/model")
+
+    assert result == str(snapshot_dir)
+
+
+def test_resolve_local_hf_snapshot_returns_none_without_main_reference(
+    tmp_path, monkeypatch
+):
+    _, snapshots_dir = _create_hf_cache(tmp_path)
+    (snapshots_dir / "revision-a").mkdir()
+    (snapshots_dir / "revision-b").mkdir()
+
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "aidetector.model.Path.home", lambda: tmp_path / "no-home-cache"
+    )
+
+    assert _resolve_local_hf_snapshot("example/model") is None
+
+
+def test_resolve_local_hf_snapshot_returns_none_for_stale_main_reference(
+    tmp_path, monkeypatch
+):
+    hub_dir, snapshots_dir = _create_hf_cache(tmp_path)
+    (snapshots_dir / "revision-a").mkdir()
+    (snapshots_dir / "revision-b").mkdir()
+    (hub_dir / "refs").mkdir()
+    (hub_dir / "refs" / "main").write_text(
+        "missing-revision", encoding="utf-8"
+    )
+
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "aidetector.model.Path.home", lambda: tmp_path / "no-home-cache"
+    )
+
+    assert _resolve_local_hf_snapshot("example/model") is None
+
+def test_hf_cached_snapshot_failure_does_not_retry_online(
+    monkeypatch, tmp_path
+):
+    import sys
+    from types import SimpleNamespace
+
+    import aidetector.model as model_module
+
+    calls = []
+
+    def fake_from_pretrained(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise OSError("incomplete local snapshot")
+
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(is_available=lambda: False),
+        backends=SimpleNamespace(),
+        device=lambda value: value,
+    )
+
+    fake_transformers = SimpleNamespace(
+        AutoImageProcessor=object(),
+        AutoModelForImageClassification=SimpleNamespace(
+            from_pretrained=fake_from_pretrained
+        ),
+    )
+
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    monkeypatch.setattr(
+        model_module,
+        "_resolve_local_hf_snapshot",
+        lambda model_id: str(tmp_path / "snapshot"),
+    )
+
+    with pytest.raises(
+        RuntimeError, match="Online fallback was not attempted"
+    ):
+        HuggingFaceImageDetector(model_id="example/test-model")
+
+    assert len(calls) == 1
+    assert calls[0][0][0] == str(tmp_path / "snapshot")
+    assert calls[0][1]["local_files_only"] is True
+
+def test_build_fallback_image_processor_uses_model_config(
+    monkeypatch,
+):
+    import sys
+    from types import SimpleNamespace
+
+    captured = {}
+
+    class FakeViTImageProcessor:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    fake_transformers = SimpleNamespace(
+        ViTImageProcessor=FakeViTImageProcessor,
+    )
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    config = SimpleNamespace(
+        image_size=384,
+        image_mean=[0.48, 0.45, 0.40],
+        image_std=[0.23, 0.22, 0.22],
+    )
+
+    processor = _build_fallback_image_processor(config)
+
+    assert isinstance(processor, FakeViTImageProcessor)
+    assert captured["size"] == {"height": 384, "width": 384}
+    assert captured["image_mean"] == [0.48, 0.45, 0.40]
+    assert captured["image_std"] == [0.23, 0.22, 0.22]
+    assert captured["do_resize"] is True
+    assert captured["do_rescale"] is True
+    assert captured["rescale_factor"] == 1 / 255
+    assert captured["do_normalize"] is True

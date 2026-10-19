@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import json
-
-import pytest
 from pathlib import Path
 
+import pytest
 from PIL import Image
 from typer.testing import CliRunner
 
@@ -191,3 +190,171 @@ def test_main_handles_safe_checkpoint_error(monkeypatch, capsys):
 
     assert exc.value.code == 1
     assert "blocked checkpoint for test" in capsys.readouterr().out
+
+
+
+def test_predict_paths_discards_failed_batch_and_processes_next_file(tmp_path):
+    class FailFirstBatchDetector(BrightnessDetector):
+        def __init__(self):
+            self.seen_batches = []
+
+        def predict_images(self, images, paths=None):
+            self.seen_batches.append(list(paths or []))
+            if len(self.seen_batches) == 1:
+                raise RuntimeError("synthetic prediction failure")
+            return super().predict_images(images, paths)
+
+    paths = [
+        tmp_path / "first.png",
+        tmp_path / "second.png",
+        tmp_path / "third.png",
+    ]
+    for index, image_path in enumerate(paths):
+        Image.new("RGB", (8, 8), ["black", "white", "gray"][index]).save(
+            image_path
+        )
+
+    detector = FailFirstBatchDetector()
+    results = cli._predict_paths(
+        detector,
+        paths,
+        batch_size=2,
+        quiet=True,
+    )
+
+    assert detector.seen_batches == [paths[:2], paths[2:]]
+    assert [result.path for result in results] == [paths[2]]
+
+
+
+def test_predict_paths_handles_failed_final_batch(tmp_path, capsys):
+    class AlwaysFailDetector(BrightnessDetector):
+        def predict_images(self, images, paths=None):
+            raise RuntimeError("synthetic final-batch failure")
+
+    paths = [tmp_path / f"image-{index}.png" for index in range(3)]
+    for image_path in paths:
+        Image.new("RGB", (8, 8), "gray").save(image_path)
+
+    results = cli._predict_paths(
+        AlwaysFailDetector(),
+        paths,
+        batch_size=5,
+        quiet=True,
+    )
+
+    assert results == []
+    output = capsys.readouterr()
+    assert "Failed final batch:" in output.err
+    assert "synthetic final-batch failure" in output.err
+
+
+
+def test_detect_json_keeps_batch_errors_on_stderr(tmp_path, monkeypatch):
+    class FailFirstBatchDetector(BrightnessDetector):
+        def __init__(self):
+            self.calls = 0
+
+        def predict_images(self, images, paths=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("synthetic JSON batch failure")
+            return super().predict_images(images, paths)
+
+    monkeypatch.setattr(
+        "aidetector.cli.create_detector",
+        lambda *args, **kwargs: FailFirstBatchDetector(),
+    )
+    for index in range(3):
+        Image.new("RGB", (8, 8), "white").save(
+            tmp_path / f"image-{index}.png"
+        )
+
+    result = CliRunner().invoke(
+        app,
+        ["detect", str(tmp_path), "--json", "--batch-size", "2"],
+    )
+
+    assert result.exit_code == 1, result.output
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    payloads = [json.loads(line) for line in lines]
+    assert len(payloads) == 1
+    assert payloads[0]["path"].endswith("image-2.png")
+    assert "Failed batch:" in result.stderr
+    assert "synthetic JSON batch failure" in result.stderr
+    assert "Incomplete run:" in result.stderr
+
+
+def test_detect_rejects_nonfixed_or_ensemble_threshold(tmp_path, monkeypatch):
+    image_path = tmp_path / "input.png"
+    Image.new("RGB", (8, 8), "gray").save(image_path)
+    factory_called = False
+
+    def unexpected_factory(*args, **kwargs):
+        nonlocal factory_called
+        factory_called = True
+        raise AssertionError("Detector factory must not run for invalid CLI input")
+
+    monkeypatch.setattr(cli, "create_detector", unexpected_factory)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "detect",
+            str(image_path),
+            "--backend",
+            "or-ensemble",
+            "--threshold",
+            "0.6",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "OR ensemble" in result.output
+    assert factory_called is False
+
+
+
+@pytest.mark.parametrize(
+    ("command", "command_args"),
+    [
+        ("benchmark-folder", ["unused-dataset"]),
+        ("benchmark-hf", ["unused/dataset"]),
+        ("serve", []),
+        ("api", []),
+    ],
+)
+def test_cli_entrypoints_reject_nonfixed_or_threshold(
+    command, command_args, monkeypatch
+):
+    import sys
+    from types import ModuleType
+
+    def unexpected_factory(*args, **kwargs):
+        raise AssertionError("Detector factory must not run for invalid CLI input")
+
+    monkeypatch.setattr(cli, "create_detector", unexpected_factory)
+
+    if command == "api":
+        fake_api = ModuleType("aidetector.api")
+        fake_api.create_app = lambda **kwargs: object()
+        fake_uvicorn = ModuleType("uvicorn")
+        fake_uvicorn.run = lambda *args, **kwargs: None
+        monkeypatch.setitem(sys.modules, "aidetector.api", fake_api)
+        monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            command,
+            *command_args,
+            "--backend",
+            "OR-ENSEMBLE",
+            "--threshold",
+            "0.6",
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "OR ensemble" in result.output
+    assert "Traceback" not in result.output

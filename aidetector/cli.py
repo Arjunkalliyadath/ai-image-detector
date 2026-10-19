@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import typer
 from PIL import Image, ImageOps
@@ -13,17 +13,16 @@ from tqdm import tqdm
 
 from .checkpoint_utils import SafeCheckpointLoadError
 from .config import (
-        DEFAULT_BACKEND,
-        DEFAULT_HF_MODEL_ID,
-        DEFAULT_HYBRID_UNIVFD_WEIGHT,
-        DEFAULT_HYBRID_PLUS_PRIMARY_WEIGHT,
-        DEFAULT_MODEL_NAME,
-        DEFAULT_ULTRA_PRIMARY_WEIGHT,
-        DEFAULT_PRETRAINED,
+    DEFAULT_BACKEND,
+    DEFAULT_HF_MODEL_ID,
+    DEFAULT_HYBRID_PLUS_PRIMARY_WEIGHT,
+    DEFAULT_HYBRID_UNIVFD_WEIGHT,
+    DEFAULT_MODEL_NAME,
+    DEFAULT_PRETRAINED,
+    DEFAULT_ULTRA_PRIMARY_WEIGHT,
 )
 from .evaluation import (
     build_combined_predictions,
-    search_blend_weight_threshold,
     collect_folder_samples,
     collect_predictions,
     collect_tiny_genimage_parquet_samples,
@@ -31,8 +30,9 @@ from .evaluation import (
     compute_metrics,
     evaluate_folder,
     evaluate_hf_dataset,
-    group_prediction_rows_against_reference,
     group_prediction_rows,
+    group_prediction_rows_against_reference,
+    search_blend_weight_threshold,
     search_hybrid_weight_threshold,
     search_threshold,
     split_samples_balanced,
@@ -44,19 +44,29 @@ from .types import DetectionResult, EvaluationReport
 app = typer.Typer(help="Simple AI-generated image detector powered by UnivFD/CLIP.")
 console = Console()
 VALID_OPTIMIZE_METRICS = {"balanced_accuracy", "f1", "recall", "precision"}
+OR_ENSEMBLE_BACKENDS = frozenset(
+    {"or-ensemble", "or-ensemble-high-recall"}
+)
+
+
+def _validate_or_ensemble_threshold(backend: str, threshold: float) -> None:
+    if backend.lower() in OR_ENSEMBLE_BACKENDS and threshold != 0.5:
+        raise typer.BadParameter(
+            "OR ensemble modes require a fixed global threshold of 0.5."
+        )
 
 
 @app.command()
 def detect(
     path: Path = typer.Argument(..., help="Image file or directory."),
     recursive: bool = typer.Option(True, "--recursive/--no-recursive", help="Scan folders recursively."),
-    threshold: float = typer.Option(0.5, help="AI probability threshold."),
-    device: Optional[str] = typer.Option(None, help="cuda, mps, cpu, or auto when omitted."),
+    threshold: float = typer.Option(0.5, help="Decision threshold; OR ensemble modes require a fixed global cutoff of 0.5."),
+    device: str | None = typer.Option(None, help="cuda, mps, cpu, or auto when omitted."),
     backend: str = typer.Option(
         DEFAULT_BACKEND,
-        help="Detector backend: univfd, hf, nonescape-mini, nonescape-full, sentry-convnext-small, hybrid, hybrid-plus, or ultra.",
+        help="Backends include univfd, hf, nonescape-mini, nonescape-full, sentry-convnext-small, hybrid, hybrid-plus, ultra, or-ensemble, and or-ensemble-high-recall. OR modes use fixed component thresholds, a 0.5 cutoff, and uncalibrated composite scores.",
     ),
-    weight_path: Optional[Path] = typer.Option(None, help="Optional local UnivFD fc_weights.pth path."),
+    weight_path: Path | None = typer.Option(None, help="Optional local UnivFD fc_weights.pth path."),
     model_name: str = typer.Option(DEFAULT_MODEL_NAME, help="OpenCLIP model name for UnivFD."),
     pretrained: str = typer.Option(DEFAULT_PRETRAINED, help="OpenCLIP pretrained tag for UnivFD."),
     hf_model: str = typer.Option(DEFAULT_HF_MODEL_ID, help="Hugging Face model id for --backend hf."),
@@ -80,9 +90,11 @@ def detect(
     ),
     batch_size: int = typer.Option(16, min=1, help="Batch size for inference."),
     json_output: bool = typer.Option(False, "--json", help="Print JSON lines instead of a table."),
-    csv_output: Optional[Path] = typer.Option(None, "--csv", help="Save CSV report."),
+    csv_output: Path | None = typer.Option(None, "--csv", help="Save CSV report."),
 ) -> None:
     """Detect whether an image, or images in a folder, are AI-generated."""
+    _validate_or_ensemble_threshold(backend, threshold)
+
     paths = iter_images(path, recursive=recursive)
     if not paths:
         raise typer.BadParameter(f"No supported images found at {path}")
@@ -100,18 +112,35 @@ def detect(
         ultra_primary_weight=ultra_primary_weight,
     )
     results = _predict_paths(detector, paths, batch_size=batch_size, quiet=json_output)
+    incomplete = len(results) != len(paths)
+    if incomplete:
+        Console(stderr=True).print(
+            f"[red]Incomplete run:[/red] expected {len(paths)} result(s), "
+            f"received {len(results)}."
+        )
 
     if csv_output:
-        _write_csv(results, csv_output)
-        console.print(f"Saved CSV report to {csv_output}")
+        _write_csv(
+            results,
+            csv_output,
+            include_details=backend.lower() in OR_ENSEMBLE_BACKENDS,
+        )
+        if json_output:
+            Console(stderr=True).print(f"Saved CSV report to {csv_output}")
+        else:
+            console.print(f"Saved CSV report to {csv_output}")
 
     if json_output:
         for result in results:
             print(json.dumps(result.as_dict(), ensure_ascii=False))
+        if incomplete:
+            raise typer.Exit(code=1)
         return
 
     _print_detection_table(results)
     console.print("[yellow]Note:[/yellow] AI image detection is probabilistic; do not use it as sole proof.")
+    if incomplete:
+        raise typer.Exit(code=1)
 
 
 @app.command("benchmark-folder")
@@ -120,14 +149,14 @@ def benchmark_folder_command(
     real_dir: str = typer.Option("real", help="Folder name containing real images."),
     fake_dir: str = typer.Option("ai", help="Folder name containing AI/fake images."),
     recursive: bool = typer.Option(True, "--recursive/--no-recursive", help="Scan folders recursively."),
-    max_per_class: Optional[int] = typer.Option(None, min=1, help="Optional cap per class."),
-    threshold: float = typer.Option(0.5, help="AI probability threshold."),
-    device: Optional[str] = typer.Option(None, help="cuda, mps, cpu, or auto when omitted."),
+    max_per_class: int | None = typer.Option(None, min=1, help="Optional cap per class."),
+    threshold: float = typer.Option(0.5, help="Decision threshold; OR ensemble modes require a fixed global cutoff of 0.5."),
+    device: str | None = typer.Option(None, help="cuda, mps, cpu, or auto when omitted."),
     backend: str = typer.Option(
         DEFAULT_BACKEND,
-        help="Detector backend: univfd, hf, nonescape-mini, nonescape-full, sentry-convnext-small, hybrid, hybrid-plus, or ultra.",
+        help="Backends include univfd, hf, nonescape-mini, nonescape-full, sentry-convnext-small, hybrid, hybrid-plus, ultra, or-ensemble, and or-ensemble-high-recall. OR modes use fixed component thresholds, a 0.5 cutoff, and uncalibrated composite scores.",
     ),
-    weight_path: Optional[Path] = typer.Option(None, help="Optional local UnivFD fc_weights.pth path."),
+    weight_path: Path | None = typer.Option(None, help="Optional local UnivFD fc_weights.pth path."),
     model_name: str = typer.Option(DEFAULT_MODEL_NAME, help="OpenCLIP model name for UnivFD."),
     pretrained: str = typer.Option(DEFAULT_PRETRAINED, help="OpenCLIP pretrained tag for UnivFD."),
     hf_model: str = typer.Option(DEFAULT_HF_MODEL_ID, help="Hugging Face model id for --backend hf."),
@@ -150,9 +179,10 @@ def benchmark_folder_command(
         help="Blend weight for hybrid-plus when --backend ultra.",
     ),
     batch_size: int = typer.Option(16, min=1, help="Batch size for inference."),
-    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Write JSON benchmark report."),
+    output: Path | None = typer.Option(None, "--output", "-o", help="Write JSON benchmark report."),
 ) -> None:
     """Evaluate on an image-folder benchmark."""
+    _validate_or_ensemble_threshold(backend, threshold)
     detector = create_detector(
         backend,
         device=device,
@@ -184,17 +214,17 @@ def benchmark_hf_command(
     image_field: str = typer.Option("image", help="Image column name."),
     label_field: str = typer.Option("label", help="Binary label column name."),
     fake_label: str = typer.Option("1", help="Value in label column that means AI/fake."),
-    max_samples: Optional[int] = typer.Option(None, min=1, help="Optional sample cap."),
+    max_samples: int | None = typer.Option(None, min=1, help="Optional sample cap."),
     streaming: bool = typer.Option(False, help="Use streaming dataset loading."),
-    shuffle_seed: Optional[int] = typer.Option(None, help="Shuffle before sampling."),
+    shuffle_seed: int | None = typer.Option(None, help="Shuffle before sampling."),
     trust_remote_code: bool = typer.Option(False, help="Allow remote dataset code."),
-    threshold: float = typer.Option(0.5, help="AI probability threshold."),
-    device: Optional[str] = typer.Option(None, help="cuda, mps, cpu, or auto when omitted."),
+    threshold: float = typer.Option(0.5, help="Decision threshold; OR ensemble modes require a fixed global cutoff of 0.5."),
+    device: str | None = typer.Option(None, help="cuda, mps, cpu, or auto when omitted."),
     backend: str = typer.Option(
         DEFAULT_BACKEND,
-        help="Detector backend: univfd, hf, nonescape-mini, nonescape-full, sentry-convnext-small, hybrid, hybrid-plus, or ultra.",
+        help="Backends include univfd, hf, nonescape-mini, nonescape-full, sentry-convnext-small, hybrid, hybrid-plus, ultra, or-ensemble, and or-ensemble-high-recall. OR modes use fixed component thresholds, a 0.5 cutoff, and uncalibrated composite scores.",
     ),
-    weight_path: Optional[Path] = typer.Option(None, help="Optional local UnivFD fc_weights.pth path."),
+    weight_path: Path | None = typer.Option(None, help="Optional local UnivFD fc_weights.pth path."),
     model_name: str = typer.Option(DEFAULT_MODEL_NAME, help="OpenCLIP model name for UnivFD."),
     pretrained: str = typer.Option(DEFAULT_PRETRAINED, help="OpenCLIP pretrained tag for UnivFD."),
     hf_model: str = typer.Option(DEFAULT_HF_MODEL_ID, help="Hugging Face model id for --backend hf."),
@@ -217,9 +247,10 @@ def benchmark_hf_command(
         help="Blend weight for hybrid-plus when --backend ultra.",
     ),
     batch_size: int = typer.Option(16, min=1, help="Batch size for inference."),
-    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Write JSON benchmark report."),
+    output: Path | None = typer.Option(None, "--output", "-o", help="Write JSON benchmark report."),
 ) -> None:
     """Evaluate on a Hugging Face image dataset."""
+    _validate_or_ensemble_threshold(backend, threshold)
     detector = create_detector(
         backend,
         device=device,
@@ -254,7 +285,7 @@ def benchmark_calibrated_folder_command(
     real_dir: str = typer.Option("real", help="Folder name containing real images."),
     fake_dir: str = typer.Option("ai", help="Folder name containing AI/fake images."),
     recursive: bool = typer.Option(True, "--recursive/--no-recursive", help="Scan folders recursively."),
-    max_per_class: Optional[int] = typer.Option(None, min=2, help="Optional cap per class."),
+    max_per_class: int | None = typer.Option(None, min=2, help="Optional cap per class."),
     calibration_fraction: float = typer.Option(
         0.5,
         min=0.05,
@@ -263,12 +294,12 @@ def benchmark_calibrated_folder_command(
     ),
     split_seed: str = typer.Option("aidetect", help="Seed used for deterministic calibration/test split."),
     threshold: float = typer.Option(0.5, help="Fallback threshold before calibration."),
-    device: Optional[str] = typer.Option(None, help="cuda, mps, cpu, or auto when omitted."),
+    device: str | None = typer.Option(None, help="cuda, mps, cpu, or auto when omitted."),
     backend: str = typer.Option(
         "hybrid",
         help="Backend to calibrate: univfd, hf, nonescape-mini, nonescape-full, sentry-convnext-small, hybrid, hybrid-plus, or ultra.",
     ),
-    weight_path: Optional[Path] = typer.Option(None, help="Optional local UnivFD fc_weights.pth path."),
+    weight_path: Path | None = typer.Option(None, help="Optional local UnivFD fc_weights.pth path."),
     model_name: str = typer.Option(DEFAULT_MODEL_NAME, help="OpenCLIP model name for UnivFD."),
     pretrained: str = typer.Option(DEFAULT_PRETRAINED, help="OpenCLIP pretrained tag for UnivFD."),
     hf_model: str = typer.Option(DEFAULT_HF_MODEL_ID, help="Hugging Face model id for HF or hybrid."),
@@ -300,14 +331,14 @@ def benchmark_calibrated_folder_command(
         "balanced_accuracy",
         help="Calibration objective: balanced_accuracy, f1, recall, or precision.",
     ),
-    min_recall: Optional[float] = typer.Option(
+    min_recall: float | None = typer.Option(
         None,
         min=0.0,
         max=1.0,
         help="Optional minimum calibration recall constraint for threshold search.",
     ),
     batch_size: int = typer.Option(16, min=1, help="Batch size for inference."),
-    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Write JSON calibration benchmark report."),
+    output: Path | None = typer.Option(None, "--output", "-o", help="Write JSON calibration benchmark report."),
 ) -> None:
     """Calibrate threshold on a held-out split, then evaluate on a disjoint test split."""
     _validate_optimize_metric(optimize_metric)
@@ -373,22 +404,22 @@ def benchmark_tiny_genimage_local_command(
         help="Fraction of each class reserved for calibration.",
     ),
     split_seed: str = typer.Option("aidetect", help="Seed used for deterministic calibration/test split."),
-    max_per_class_per_shard: Optional[int] = typer.Option(
+    max_per_class_per_shard: int | None = typer.Option(
         None,
         min=1,
         help="Optional cap per class inside each parquet shard.",
     ),
-    generators: Optional[str] = typer.Option(
+    generators: str | None = typer.Option(
         None,
         help="Comma-separated generator filter, for example 'Midjourney,SD14'.",
     ),
     threshold: float = typer.Option(0.5, help="Fallback threshold before calibration."),
-    device: Optional[str] = typer.Option(None, help="cuda, mps, cpu, or auto when omitted."),
+    device: str | None = typer.Option(None, help="cuda, mps, cpu, or auto when omitted."),
     backend: str = typer.Option(
         "univfd",
         help="Backend to calibrate: univfd, hf, nonescape-mini, nonescape-full, sentry-convnext-small, hybrid, hybrid-plus, or ultra.",
     ),
-    weight_path: Optional[Path] = typer.Option(None, help="Optional local UnivFD fc_weights.pth path."),
+    weight_path: Path | None = typer.Option(None, help="Optional local UnivFD fc_weights.pth path."),
     model_name: str = typer.Option(DEFAULT_MODEL_NAME, help="OpenCLIP model name for UnivFD."),
     pretrained: str = typer.Option(DEFAULT_PRETRAINED, help="OpenCLIP pretrained tag for UnivFD."),
     hf_model: str = typer.Option(DEFAULT_HF_MODEL_ID, help="Hugging Face model id for HF or hybrid."),
@@ -420,14 +451,14 @@ def benchmark_tiny_genimage_local_command(
         "balanced_accuracy",
         help="Calibration objective: balanced_accuracy, f1, recall, or precision.",
     ),
-    min_recall: Optional[float] = typer.Option(
+    min_recall: float | None = typer.Option(
         None,
         min=0.0,
         max=1.0,
         help="Optional minimum calibration recall constraint for threshold search.",
     ),
     batch_size: int = typer.Option(16, min=1, help="Batch size for inference."),
-    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Write JSON report."),
+    output: Path | None = typer.Option(None, "--output", "-o", help="Write JSON report."),
 ) -> None:
     """Benchmark one or more local Tiny-GenImage parquet shards with per-generator summaries."""
     _validate_optimize_metric(optimize_metric)
@@ -492,7 +523,7 @@ def prepare_tiny_genimage_command(
         "data/validation-00000-of-00004.parquet",
         help="Parquet shard inside the dataset repo.",
     ),
-    local_parquet: Optional[Path] = typer.Option(
+    local_parquet: Path | None = typer.Option(
         None,
         help="Use an already-downloaded parquet shard instead of fetching from Hugging Face.",
     ),
@@ -550,13 +581,13 @@ def prepare_tiny_genimage_command(
 
 @app.command()
 def serve(
-    threshold: float = typer.Option(0.5, help="AI probability threshold."),
-    device: Optional[str] = typer.Option(None, help="cuda, mps, cpu, or auto when omitted."),
+    threshold: float = typer.Option(0.5, help="Decision threshold; OR ensemble modes require a fixed global cutoff of 0.5."),
+    device: str | None = typer.Option(None, help="cuda, mps, cpu, or auto when omitted."),
     backend: str = typer.Option(
         DEFAULT_BACKEND,
-        help="Detector backend: univfd, hf, nonescape-mini, nonescape-full, sentry-convnext-small, hybrid, hybrid-plus, or ultra.",
+        help="Backends include univfd, hf, nonescape-mini, nonescape-full, sentry-convnext-small, hybrid, hybrid-plus, ultra, or-ensemble, and or-ensemble-high-recall. OR modes use fixed component thresholds, a 0.5 cutoff, and uncalibrated composite scores.",
     ),
-    weight_path: Optional[Path] = typer.Option(None, help="Optional local UnivFD fc_weights.pth path."),
+    weight_path: Path | None = typer.Option(None, help="Optional local UnivFD fc_weights.pth path."),
     hf_model: str = typer.Option(DEFAULT_HF_MODEL_ID, help="Hugging Face model id for --backend hf."),
     hybrid_univfd_weight: float = typer.Option(
         DEFAULT_HYBRID_UNIVFD_WEIGHT,
@@ -578,6 +609,7 @@ def serve(
     ),
 ) -> None:
     """Launch a local Gradio web UI."""
+    _validate_or_ensemble_threshold(backend, threshold)
     try:
         import gradio as gr
     except ImportError as exc:
@@ -605,7 +637,12 @@ def serve(
         inputs=gr.Image(type="pil", label="Upload image"),
         outputs=gr.JSON(label="Detection result"),
         title="AI Image Detector",
-        description="AI-generated image detector. Results are probabilistic.",
+        description=(
+            "OR ensemble score is threshold-normalized evidence, not a "
+            "calibrated probability. The global decision cutoff is fixed at 0.5."
+            if backend.lower() in OR_ENSEMBLE_BACKENDS
+            else "AI-generated image detector. Results are probabilistic."
+        ),
     )
     demo.launch()
 
@@ -614,13 +651,13 @@ def serve(
 def api_command(
     host: str = typer.Option("127.0.0.1", help="Host to bind."),
     port: int = typer.Option(8000, help="Port to bind."),
-    threshold: float = typer.Option(0.5, help="AI probability threshold."),
-    device: Optional[str] = typer.Option(None, help="cuda, mps, cpu, or auto when omitted."),
+    threshold: float = typer.Option(0.5, help="Decision threshold; OR ensemble modes require a fixed global cutoff of 0.5."),
+    device: str | None = typer.Option(None, help="cuda, mps, cpu, or auto when omitted."),
     backend: str = typer.Option(
         DEFAULT_BACKEND,
-        help="Detector backend: univfd, hf, nonescape-mini, nonescape-full, sentry-convnext-small, hybrid, hybrid-plus, or ultra.",
+        help="Backends include univfd, hf, nonescape-mini, nonescape-full, sentry-convnext-small, hybrid, hybrid-plus, ultra, or-ensemble, and or-ensemble-high-recall. OR modes use fixed component thresholds, a 0.5 cutoff, and uncalibrated composite scores.",
     ),
-    weight_path: Optional[Path] = typer.Option(None, help="Optional local UnivFD fc_weights.pth path."),
+    weight_path: Path | None = typer.Option(None, help="Optional local UnivFD fc_weights.pth path."),
     hf_model: str = typer.Option(DEFAULT_HF_MODEL_ID, help="Hugging Face model id for --backend hf."),
     hybrid_univfd_weight: float = typer.Option(
         DEFAULT_HYBRID_UNIVFD_WEIGHT,
@@ -642,6 +679,7 @@ def api_command(
     ),
 ) -> None:
     """Launch a FastAPI service."""
+    _validate_or_ensemble_threshold(backend, threshold)
     try:
         import uvicorn
     except ImportError as exc:
@@ -664,63 +702,113 @@ def api_command(
 
 def _predict_paths(detector, paths: list[Path], *, batch_size: int, quiet: bool) -> list[DetectionResult]:
     results: list[DetectionResult] = []
+    error_console = Console(stderr=True)
     batch_images = []
     batch_paths = []
     iterator = tqdm(paths, disable=quiet or len(paths) == 1)
+
     for image_path in iterator:
         try:
             with Image.open(image_path) as image:
                 batch_images.append(ImageOps.exif_transpose(image).convert("RGB"))
             batch_paths.append(image_path)
-            if len(batch_images) >= batch_size:
+        except Exception as exc:  # noqa: BLE001
+            error_console.print(f"[red]Failed:[/red] {image_path} ({exc})")
+            continue
+
+        if len(batch_images) >= batch_size:
+            try:
                 results.extend(detector.predict_images(batch_images, paths=batch_paths))
+            except Exception as exc:  # noqa: BLE001
+                failed_paths = ", ".join(str(path) for path in batch_paths)
+                error_console.print(f"[red]Failed batch:[/red] {failed_paths} ({exc})")
+            finally:
                 batch_images = []
                 batch_paths = []
-        except Exception as exc:  # noqa: BLE001
-            console.print(f"[red]Failed:[/red] {image_path} ({exc})")
+
     if batch_images:
-        results.extend(detector.predict_images(batch_images, paths=batch_paths))
+        try:
+            results.extend(detector.predict_images(batch_images, paths=batch_paths))
+        except Exception as exc:  # noqa: BLE001
+            failed_paths = ", ".join(str(path) for path in batch_paths)
+            error_console.print(f"[red]Failed final batch:[/red] {failed_paths} ({exc})")
+
     return results
 
 
-def _write_csv(results: list[DetectionResult], output: Path) -> None:
+def _write_csv(
+    results: list[DetectionResult],
+    output: Path,
+    *,
+    include_details: bool = False,
+) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
+    rows = [result.as_dict() for result in results]
+    fieldnames = [
+        "path",
+        "label",
+        "probability_ai",
+        "probability_real",
+        "confidence",
+        "raw_score",
+        "backend",
+    ]
+
+    if include_details or any("details" in row for row in rows):
+        fieldnames.append("details")
+        for row in rows:
+            details = row.get("details")
+            row["details"] = (
+                json.dumps(details, ensure_ascii=False)
+                if details is not None
+                else ""
+            )
+
     with output.open("w", newline="", encoding="utf-8") as f:
-        fieldnames = [
-            "path",
-            "label",
-            "probability_ai",
-            "probability_real",
-            "confidence",
-            "raw_score",
-            "backend",
-        ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows([r.as_dict() for r in results])
+        writer.writerows(rows)
 
 
 def _print_detection_table(results: list[DetectionResult]) -> None:
+    has_composite_score = any(
+        result.details is not None
+        and result.details.get("score_semantics") is not None
+        for result in results
+    )
+
     table = Table(title="AI Image Detection Results")
     table.add_column("Image")
     table.add_column("Label")
-    table.add_column("AI Prob", justify="right")
-    table.add_column("Real Prob", justify="right")
-    table.add_column("Confidence", justify="right")
+    if has_composite_score:
+        table.add_column("OR Score", justify="right")
+    else:
+        table.add_column("AI Prob", justify="right")
+        table.add_column("Real Prob", justify="right")
+        table.add_column("Confidence", justify="right")
     table.add_column("Backend")
+
     for result in results:
         row_style = "red" if result.label == "ai" else "green"
-        table.add_row(
+        row = [
             str(result.path),
             result.label.upper(),
             f"{result.probability_ai:.3f}",
-            f"{result.probability_real:.3f}",
-            f"{result.confidence:.3f}",
-            result.backend,
-            style=row_style,
-        )
-    console.print(table)
+        ]
+        if not has_composite_score:
+            row.extend([
+                f"{result.probability_real:.3f}",
+                f"{result.confidence:.3f}",
+            ])
+        row.append(result.backend)
+        table.add_row(*row, style=row_style)
 
+    console.print(table)
+    if has_composite_score:
+        console.print(
+            "[yellow]Note:[/yellow] OR Score is a composite evidence score, "
+            "not a calibrated probability."
+        )
 
 def _finish_benchmark(report: EvaluationReport, output: Path | None) -> None:
     if output:
@@ -753,8 +841,8 @@ def _run_calibrated_folder_benchmark(
     test_samples,
     backend: str,
     threshold: float,
-    device: Optional[str],
-    weight_path: Optional[Path],
+    device: str | None,
+    weight_path: Path | None,
     model_name: str,
     pretrained: str,
     hf_model: str,
@@ -763,12 +851,17 @@ def _run_calibrated_folder_benchmark(
     ultra_primary_weight: float,
     hybrid_alpha_step: float,
     optimize_metric: str,
-    min_recall: Optional[float],
+    min_recall: float | None,
     batch_size: int,
     dataset_info: dict[str, Any],
     group_fields: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     backend = backend.lower()
+    if backend in {"or-ensemble", "or-ensemble-high-recall"}:
+        raise typer.BadParameter(
+            "OR ensemble uses fixed component thresholds and cannot be "
+            "threshold-calibrated; use its fixed global cutoff of 0.5."
+        )
     if backend in {"ultra", "hybrid-ultra", "sentry-plus"}:
         primary_detector = create_detector(
             "hybrid-plus",

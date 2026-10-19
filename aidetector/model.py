@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import math
 import os
+import warnings
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Iterable, Protocol, Sequence
+from typing import ClassVar, Protocol
 
 from PIL import Image, ImageOps
 
@@ -10,11 +14,11 @@ from .checkpoint_utils import load_torch_checkpoint
 from .config import (
     DEFAULT_BACKEND,
     DEFAULT_HF_MODEL_ID,
-    DEFAULT_HYBRID_UNIVFD_WEIGHT,
     DEFAULT_HYBRID_PLUS_PRIMARY_WEIGHT,
+    DEFAULT_HYBRID_UNIVFD_WEIGHT,
     DEFAULT_MODEL_NAME,
-    DEFAULT_ULTRA_PRIMARY_WEIGHT,
     DEFAULT_PRETRAINED,
+    DEFAULT_ULTRA_PRIMARY_WEIGHT,
     FC_WEIGHT_PATH_IN_REPO,
     IMAGE_EXTENSIONS,
     MODEL_REPO_ID,
@@ -57,6 +61,33 @@ def _select_device(torch_module, requested: str | None) -> str:
 
 def _normalise_image(image: Image.Image) -> Image.Image:
     return ImageOps.exif_transpose(image).convert("RGB")
+
+
+def _threshold_centered_score(score: float, threshold: float) -> float:
+    """Map a component score to [0, 1], centering its decision threshold at 0.5.
+
+    This monotonic transformation preserves the component's threshold decision.
+    The result is a composite evidence score when used in an ensemble, not a
+    calibrated real-world probability.
+    """
+    if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+        raise ValueError("score must be finite and between 0 and 1")
+    if not math.isfinite(threshold) or not 0.0 < threshold < 1.0:
+        raise ValueError("threshold must be finite and strictly between 0 and 1")
+
+    if score < threshold:
+        return score / (2.0 * threshold)
+    return 0.5 + (score - threshold) / (2.0 * (1.0 - threshold))
+
+
+def _checkpoint_fingerprint(path: str | Path) -> dict[str, str]:
+    """Return the resolved checkpoint path and its SHA-256 digest."""
+    checkpoint_path = Path(path).resolve()
+    digest = hashlib.sha256()
+    with checkpoint_path.open("rb") as checkpoint_file:
+        for chunk in iter(lambda: checkpoint_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {"source": str(checkpoint_path), "sha256": digest.hexdigest()}
 
 
 def _build_detection_result(
@@ -136,6 +167,7 @@ class AIImageDetector:
                 filename=FC_WEIGHT_PATH_IN_REPO,
             )
 
+        self.head_weight_path = Path(weight_path).resolve()
         state = load_torch_checkpoint(self._torch, weight_path)
         if isinstance(state, dict) and "state_dict" in state:
             state = state["state_dict"]
@@ -155,7 +187,7 @@ class AIImageDetector:
             try:
                 self.head.load_state_dict(state, strict=False)
                 return
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 raise RuntimeError(f"Could not load UnivFD head weights from {weight_path}: {exc}") from exc
         raise RuntimeError(f"Unsupported checkpoint format: {type(state)!r}")
 
@@ -262,16 +294,29 @@ class HuggingFaceImageDetector:
         self.device = torch.device(_select_device(torch, device))
         self.threshold = threshold
         self.model_id = model_id
-        model_source = _resolve_local_hf_snapshot(model_id) or model_id
-        local_only = model_source != model_id
+        cached_snapshot = _resolve_local_hf_snapshot(model_id)
+        model_source = cached_snapshot or model_id
+        local_only = cached_snapshot is not None
+
         try:
             self.model = AutoModelForImageClassification.from_pretrained(
                 model_source,
                 local_files_only=local_only,
             ).to(self.device)
-        except Exception:
+        except Exception as first_exc:
+            # A cached snapshot failed: do not silently retry online.
+            if cached_snapshot is not None:
+                raise RuntimeError(
+                    "Could not load the cached Hugging Face model snapshot. "
+                    "Online fallback was not attempted. Check the cached "
+                    f"model files for {model_id!r}. Error: {first_exc}"
+                ) from first_exc
+
+            # No cached snapshot exists, so allow a normal online download.
             try:
-                self.model = AutoModelForImageClassification.from_pretrained(model_id).to(self.device)
+                self.model = AutoModelForImageClassification.from_pretrained(
+                    model_id,
+                ).to(self.device)
             except Exception as second_exc:
                 raise RuntimeError(
                     "Could not load the requested Hugging Face model as a standard "
@@ -280,14 +325,17 @@ class HuggingFaceImageDetector:
                     "dedicated adapter instead of the generic --backend hf path. "
                     f"Model: {model_id}. Last error: {second_exc}"
                 ) from second_exc
+
         self.model.eval()
         self.id2label = self.model.config.id2label
+
         try:
             self.processor = AutoImageProcessor.from_pretrained(
                 model_source,
                 local_files_only=local_only,
             )
         except Exception:  # noqa: BLE001
+            # Some custom checkpoints lack a compatible processor config.
             self.processor = _build_fallback_image_processor(self.model.config)
 
     def model_info(self) -> dict:
@@ -667,6 +715,287 @@ class UltraDetector:
         return results
 
 
+class OREnsembleDetector:
+    """OR ensemble using fixed, threshold-normalized component evidence scores."""
+
+    backend_name = "or-ensemble"
+    threshold = 0.5
+
+    CONSERVATIVE_THRESHOLDS: ClassVar[dict[str, float]] = {
+        "nonescape-mini": 0.912901,
+        "univfd": 0.419977,
+    }
+    HIGH_RECALL_THRESHOLDS: ClassVar[dict[str, float]] = {
+        "nonescape-mini": 0.639516,
+        "univfd": 0.418636,
+    }
+    SCORE_SEMANTICS = (
+        "Composite threshold-normalized evidence score; not a calibrated probability."
+    )
+
+    def __init__(
+        self,
+        *,
+        mode: str = "conservative",
+        device: str | None = None,
+        threshold: float = 0.5,
+        weight_path: str | Path | None = None,
+        model_name: str = DEFAULT_MODEL_NAME,
+        pretrained: str = DEFAULT_PRETRAINED,
+        backend_name: str | None = None,
+    ) -> None:
+        if model_name != DEFAULT_MODEL_NAME or pretrained != DEFAULT_PRETRAINED:
+            raise ValueError(
+                "OR ensemble thresholds were calibrated for "
+                f"model_name={DEFAULT_MODEL_NAME!r} and "
+                f"pretrained={DEFAULT_PRETRAINED!r}; custom backbone "
+                "configurations are not supported."
+            )
+
+        if mode not in {"conservative", "higher-recall"}:
+            raise ValueError(
+                "mode must be 'conservative' or 'higher-recall'"
+            )
+        if threshold != 0.5:
+            raise ValueError(
+                "OR ensemble uses fixed component thresholds and a global threshold of 0.5"
+            )
+
+        if weight_path is not None:
+            warnings.warn(
+                "Using an explicit UnivFD weight path with the OR ensemble. "
+                "The thresholds were selected using the default UnivFD "
+                "configuration; compatibility with this custom head is "
+                "unverified, and calibration-time checkpoint identity has "
+                "not been verified.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        self.mode = mode
+        self.weight_path = weight_path
+        self.backend_name = backend_name or (
+            "or-ensemble"
+            if mode == "conservative"
+            else "or-ensemble-high-recall"
+        )
+        self.threshold = 0.5
+        selected_thresholds = (
+            self.CONSERVATIVE_THRESHOLDS
+            if mode == "conservative"
+            else self.HIGH_RECALL_THRESHOLDS
+        )
+        self.component_thresholds = dict(selected_thresholds)
+
+        self.nonescape = NonescapeMiniDetector(
+            threshold=self.component_thresholds["nonescape-mini"],
+            device=device,
+        )
+        self.univfd = AIImageDetector(
+            device=device,
+            threshold=self.component_thresholds["univfd"],
+            model_name=model_name,
+            pretrained=pretrained,
+            weight_path=weight_path,
+        )
+
+    def model_info(self) -> dict:
+        univfd_info = self.univfd.model_info()
+        univfd_info["head_source"] = (
+            str(self.weight_path)
+            if self.weight_path is not None
+            else f"{MODEL_REPO_ID}/{FC_WEIGHT_PATH_IN_REPO}"
+        )
+        uses_custom_head = self.weight_path is not None
+
+        cached_fingerprints = getattr(
+            self, "_checkpoint_fingerprints_cache", None
+        )
+        if cached_fingerprints is None:
+            cached_fingerprints = {}
+            mini_path = getattr(self.nonescape, "weight_file", None)
+            if mini_path is not None and Path(mini_path).is_file():
+                cached_fingerprints["nonescape-mini"] = _checkpoint_fingerprint(
+                    mini_path
+                )
+
+            head_path = getattr(self.univfd, "head_weight_path", None)
+            if head_path is None:
+                head_path = self.weight_path
+            if head_path is not None and Path(head_path).is_file():
+                cached_fingerprints["univfd-head"] = _checkpoint_fingerprint(
+                    head_path
+                )
+            self._checkpoint_fingerprints_cache = cached_fingerprints
+
+        checkpoint_fingerprints = {
+            name: dict(fingerprint)
+            for name, fingerprint in cached_fingerprints.items()
+        }
+
+        return {
+            "backend": self.backend_name,
+            "mode": self.mode,
+            "threshold": self.threshold,
+            "component_thresholds": dict(self.component_thresholds),
+            "score_semantics": self.SCORE_SEMANTICS,
+            "custom_univfd_head": uses_custom_head,
+            "threshold_calibration": (
+                "unverified-custom-univfd-head"
+                if uses_custom_head
+                else "unverified-default-univfd-head"
+            ),
+            "calibration_checkpoint_identity_verified": False,
+            "calibration_checkpoint_verification_note": (
+                "Runtime checkpoint fingerprints identify current files; they "
+                "are not verified against calibration-time checkpoint hashes."
+            ),
+            "checkpoint_fingerprints": checkpoint_fingerprints,
+            "components": {
+                "nonescape-mini": self.nonescape.model_info(),
+                "univfd": univfd_info,
+            },
+        }
+
+    def predict_image(
+        self,
+        image: Image.Image,
+        path: Path | None = None,
+    ) -> DetectionResult:
+        return self.predict_images([image], paths=[path])[0]
+
+    def predict_path(self, path: str | Path) -> DetectionResult:
+        path = Path(path)
+        with Image.open(path) as image:
+            normalized = _normalise_image(image)
+        return self.predict_image(normalized, path=path)
+
+    def predict_images(
+        self,
+        images: Sequence[Image.Image],
+        paths: Sequence[Path | None] | None = None,
+    ) -> list[DetectionResult]:
+        if not images:
+            return []
+        if paths is None:
+            paths = [None] * len(images)
+        if len(paths) != len(images):
+            raise ValueError("paths must have the same length as images")
+
+        nonescape_results = self.nonescape.predict_images(images, paths=paths)
+        univfd_results = self.univfd.predict_images(images, paths=paths)
+
+        results: list[DetectionResult] = []
+        for nonescape_result, univfd_result, path in zip(
+            nonescape_results,
+            univfd_results,
+            paths,
+            strict=True,
+        ):
+            nonescape_score = nonescape_result.probability_ai
+            univfd_score = univfd_result.probability_ai
+
+            nonescape_threshold = self.component_thresholds["nonescape-mini"]
+            univfd_threshold = self.component_thresholds["univfd"]
+
+            nonescape_normalized = _threshold_centered_score(
+                nonescape_score, nonescape_threshold
+            )
+            univfd_normalized = _threshold_centered_score(
+                univfd_score, univfd_threshold
+            )
+            composite_score = max(nonescape_normalized, univfd_normalized)
+
+            triggered_by = []
+            if nonescape_score >= nonescape_threshold:
+                triggered_by.append("nonescape-mini")
+            if univfd_score >= univfd_threshold:
+                triggered_by.append("univfd")
+
+            details = {
+                "mode": self.mode,
+                "score_semantics": self.SCORE_SEMANTICS,
+                "confidence_semantics": (
+                    "For OR ensemble results, confidence is the larger of "
+                    "the composite evidence score and its complement; it is "
+                    "not a calibrated confidence estimate."
+                ),
+                "triggered_by": triggered_by,
+                "components": {
+                    "nonescape-mini": {
+                        "probability_ai": nonescape_score,
+                        "probability_real": nonescape_result.probability_real,
+                        "raw_score": nonescape_result.raw_score,
+                        "threshold": nonescape_threshold,
+                        "label": nonescape_result.label,
+                        "triggered": "nonescape-mini" in triggered_by,
+                    },
+                    "univfd": {
+                        "probability_ai": univfd_score,
+                        "probability_real": univfd_result.probability_real,
+                        "raw_score": univfd_result.raw_score,
+                        "threshold": univfd_threshold,
+                        "label": univfd_result.label,
+                        "triggered": "univfd" in triggered_by,
+                    },
+                },
+            }
+
+            label = "ai" if composite_score >= self.threshold else "real"
+            probability_real = 1.0 - composite_score
+            confidence = (
+                composite_score if label == "ai" else probability_real
+            )
+            results.append(
+                DetectionResult(
+                    path=path,
+                    label=label,
+                    probability_ai=composite_score,
+                    probability_real=probability_real,
+                    confidence=confidence,
+                    raw_score=composite_score,
+                    backend=self.backend_name,
+                    details=details,
+                )
+            )
+
+        return results
+
+
+    def predict_many(
+        self,
+        paths: Iterable[str | Path],
+        batch_size: int = 16,
+    ) -> list[DetectionResult]:
+        """Predict images from paths in batches."""
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+
+        results: list[DetectionResult] = []
+        batch_images: list[Image.Image] = []
+        batch_paths: list[Path] = []
+
+        for path_like in paths:
+            image_path = Path(path_like)
+            with Image.open(image_path) as image:
+                batch_images.append(_normalise_image(image))
+            batch_paths.append(image_path)
+
+            if len(batch_images) >= batch_size:
+                results.extend(
+                    self.predict_images(batch_images, paths=batch_paths)
+                )
+                batch_images = []
+                batch_paths = []
+
+        if batch_images:
+            results.extend(
+                self.predict_images(batch_images, paths=batch_paths)
+            )
+
+        return results
+
+
 def create_detector(
     backend: str = DEFAULT_BACKEND,
     *,
@@ -681,6 +1010,25 @@ def create_detector(
     ultra_primary_weight: float = DEFAULT_ULTRA_PRIMARY_WEIGHT,
 ) -> Detector:
     backend = backend.lower()
+    if backend in {"or-ensemble", "or-ensemble-high-recall"}:
+        if threshold != 0.5:
+            raise ValueError(
+                "OR ensemble uses fixed component thresholds and a global threshold of 0.5"
+            )
+        mode = (
+            "conservative"
+            if backend == "or-ensemble"
+            else "higher-recall"
+        )
+        return OREnsembleDetector(
+            mode=mode,
+            device=device,
+            threshold=threshold,
+            weight_path=weight_path,
+            model_name=model_name,
+            pretrained=pretrained,
+            backend_name=backend,
+        )
     if backend == "univfd":
         return AIImageDetector(
             device=device,
@@ -744,7 +1092,7 @@ def create_detector(
         )
     raise ValueError(
         "Unsupported backend: "
-        f"{backend!r}. Choose 'univfd', 'hf', 'nonescape-mini', 'nonescape-full', 'sentry-convnext-small', 'hybrid', 'hybrid-plus', or 'ultra'."
+        f"{backend!r}. Choose 'univfd', 'hf', 'nonescape-mini', 'nonescape-full', 'sentry-convnext-small', 'hybrid', 'hybrid-plus', 'ultra', 'or-ensemble', or 'or-ensemble-high-recall'."
     )
 
 
@@ -796,15 +1144,15 @@ def _resolve_local_hf_snapshot(model_id: str) -> str | None:
             continue
 
         ref_path = hub_dir / "refs" / "main"
-        if ref_path.exists():
-            revision = ref_path.read_text(encoding="utf-8").strip()
-            snapshot_dir = hub_dir / "snapshots" / revision
-            if snapshot_dir.exists():
-                return str(snapshot_dir)
+        if not ref_path.is_file():
+            continue
 
-        snapshots_dir = hub_dir / "snapshots"
-        if snapshots_dir.exists():
-            for snapshot_dir in sorted(snapshots_dir.iterdir()):
-                if snapshot_dir.is_dir():
-                    return str(snapshot_dir)
+        revision = ref_path.read_text(encoding="utf-8").strip()
+        if not revision:
+            continue
+
+        snapshot_dir = hub_dir / "snapshots" / revision
+        if snapshot_dir.is_dir():
+            return str(snapshot_dir)
+
     return None

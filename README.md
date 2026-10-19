@@ -21,15 +21,19 @@ CVPR 2023 paper showed good cross-generator generalization compared with older
 GAN-trained detectors.
 
 This repo also ships **hybrid**, **nonescape-mini**, **sentry-convnext-small**,
-**hybrid-plus**, and **ultra** backends. `hybrid` blends UnivFD with a
-lightweight Hugging Face classifier, `nonescape-mini` and
+**hybrid-plus**, **ultra**, and two experimental OR ensemble modes. `hybrid`
+blends UnivFD with a lightweight Hugging Face classifier, `nonescape-mini` and
 `sentry-convnext-small` adapt external open-source detectors, `hybrid-plus`
 ensembles our internal hybrid with Nonescape, and `ultra` adds Sentry on top.
-These additional backends are experimental. Performance depends on the dataset, and checkpoint compatibility must be verified before use.
+`or-ensemble` combines Nonescape Mini and UnivFD using conservative fixed
+component thresholds. `or-ensemble-high-recall` lowers the Nonescape threshold
+to catch more AI images at the cost of more false positives. Performance is
+dataset-dependent, and checkpoint compatibility must be verified before use.
 
 The benchmark commands also support post-hoc threshold calibration objectives
-such as `balanced_accuracy` and `f1`. In practice, this has been one of the most
-effective low-risk levers for improving held-out performance.
+such as `balanced_accuracy` and `f1`. Calibration can improve performance for a
+chosen metric, but gains on held-out data are not guaranteed. Evaluate selected
+thresholds on a separate test split and report the resulting metrics.
 
 Recent research has moved further. **AIDE** combines CLIP semantics with low-level
 frequency/noise features and reports gains on GenImage and AIGCDetectBenchmark.
@@ -124,6 +128,29 @@ Use the external Nonescape Mini adapter directly:
 ```bash
 aidetect detect image.jpg --backend nonescape-mini
 ```
+
+Use the conservative OR ensemble:
+
+```bash
+aidetect detect image.jpg --backend or-ensemble
+```
+
+Use the higher-recall OR ensemble:
+
+```bash
+aidetect detect image.jpg --backend or-ensemble-high-recall
+```
+
+Both modes require Nonescape Mini and UnivFD, use fixed component
+thresholds, and apply a global decision cutoff of `0.5`. For these modes,
+`probability_ai` is a threshold-normalized composite evidence score, not
+a calibrated real-world probability; `probability_real` is its complement,
+not an independently calibrated real-image probability. The top-level
+`confidence` is derived from the score and its complement, not a calibrated
+confidence estimate. These field names are retained for compatibility.
+The `details` field records score semantics, confidence semantics, original
+component scores, thresholds, decisions, and which models triggered the
+OR decision. Treat both modes as experimental, not proof of authenticity.
 
 The Ultra ensemble currently depends on the Sentry checkpoint, whose safe-loading compatibility is unresolved. Do not rely on this command until a compatible checkpoint has been verified.
 
@@ -451,8 +478,39 @@ Interpretation and limitations:
   independent external validation or proof of real-world scam-detection ability.
 - Performance varies substantially by generator. The results should be treated
   as evidence, not proof of authenticity or synthetic origin.
-- The OR ensemble was calculated offline from saved per-model reports. It has
-  not yet been implemented as a selectable CLI or UI mode.
+- The benchmark results above were calculated offline from saved per-model
+  reports. The OR ensemble is now available as `or-ensemble` and
+  `or-ensemble-high-recall`. These exploratory results do not establish
+  real-world scam-detection performance.
+
+### Current OR ensemble calibration (experiment-3)
+
+The following thresholds supersede the provisional thresholds documented in
+the previous experiment above. They were selected on 876 Tiny-GenImage
+calibration samples (438 real, 438 AI-generated) using saved per-model scores.
+
+| Mode | Nonescape threshold | UnivFD threshold | Calibration balanced accuracy | Calibration FPR |
+| --- | ---: | ---: | ---: | ---: |
+| Conservative | 0.912901 | 0.419977 | 77.28% | 4.79% |
+| Higher recall | 0.639516 | 0.418636 | 84.93% | 9.82% |
+
+Held-out results on 874 samples from the same Tiny-GenImage dataset family
+(437 real, 437 AI-generated), with thresholds fixed before test evaluation:
+
+| Metric | Conservative | Higher recall |
+| --- | ---: | ---: |
+| Accuracy | 75.97% | 81.12% |
+| Precision | 89.55% | 85.23% |
+| AI recall | 58.81% | 75.29% |
+| F1 | 0.710 | 0.800 |
+| False-positive rate | 6.87% | 13.04% |
+
+Both modes exceeded their calibration false-positive-rate ceilings on the
+held-out test split: the conservative mode's 5% ceiling and the higher-recall
+mode's 10% ceiling were not met. These ceilings are empirical calibration
+constraints, not guarantees. This evaluation uses the same dataset family
+and is not external validation or evidence of real-world scam-detection
+performance. Treat detector outputs as evidence, not proof of authenticity.
 
 ## Model Weights
 
