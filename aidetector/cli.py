@@ -515,6 +515,145 @@ def benchmark_tiny_genimage_local_command(
     _print_calibrated_benchmark(report)
 
 
+@app.command("benchmark-tiny-genimage-fixed")
+def benchmark_tiny_genimage_fixed_command(
+    parquet_paths: list[Path] = typer.Argument(
+        ..., help="Local Tiny-GenImage Parquet shard files."
+    ),
+    output: Path = typer.Option(
+        Path("tiny-genimage-fixed-report.json"),
+        "--output",
+        help="JSON report path; existing files are never overwritten.",
+    ),
+    backend: str = typer.Option(
+        "or-ensemble",
+        "--backend",
+        help="or-ensemble or or-ensemble-high-recall.",
+    ),
+    max_per_class_per_shard: int | None = typer.Option(
+        25,
+        min=1,
+        help="Maximum samples per class per shard; use None in code for no cap.",
+    ),
+    generators: list[str] | None = typer.Option(
+        None, "--generator", help="Optional generator filter; repeat this option."
+    ),
+    device: str | None = typer.Option(
+        None, help="Inference device: cpu, cuda, mps, or auto."
+    ),
+    batch_size: int = typer.Option(16, min=1, help="Inference batch size."),
+) -> None:
+    """Evaluate Tiny-GenImage shards using a fixed OR-ensemble threshold."""
+    normalized_backend = backend.lower()
+
+    if normalized_backend not in OR_ENSEMBLE_BACKENDS:
+        raise typer.BadParameter(
+            "Use --backend or-ensemble or --backend or-ensemble-high-recall."
+        )
+
+    _validate_or_ensemble_threshold(normalized_backend, 0.5)
+
+    if output.exists():
+        raise typer.BadParameter(
+            f"Output already exists; choose another path: {output}"
+        )
+
+    missing = [str(path) for path in parquet_paths if not path.is_file()]
+    if missing:
+        raise typer.BadParameter(
+            f"Parquet file(s) not found: {', '.join(missing)}"
+        )
+
+    try:
+        samples = collect_tiny_genimage_parquet_samples(
+            parquet_paths,
+            max_per_class_per_shard=max_per_class_per_shard,
+            generators=set(generators) if generators else None,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    if not samples:
+        raise typer.BadParameter("No samples were loaded from the supplied shards.")
+
+    labels = {int(sample.label) for sample in samples}
+    if labels != {0, 1}:
+        raise typer.BadParameter(
+            "Evaluation requires both real and AI samples."
+        )
+
+    detector = create_detector(
+        backend=normalized_backend,
+        device=device,
+        threshold=0.5,
+    )
+
+    if getattr(detector, "threshold", None) != 0.5:
+        raise typer.BadParameter(
+            "Detector must use the fixed global threshold of 0.5."
+        )
+
+    run = collect_predictions(detector, samples, batch_size=batch_size)
+
+    metrics = compute_metrics(
+        run.y_true,
+        run.y_score,
+        run.y_pred,
+        dataset="tiny-genimage-fixed-threshold",
+        threshold=0.5,
+        seconds=run.seconds,
+    )
+
+    rows = run.predictions
+    report = {
+        "evaluation": {
+            "name": "tiny-genimage-fixed-threshold",
+            "threshold_calibration": False,
+            "global_threshold": 0.5,
+            "score_interpretation": (
+                "OR-ensemble detector scores are not calibrated probabilities."
+            ),
+            "backend": normalized_backend,
+            "sample_count": len(samples),
+            "batch_size": batch_size,
+            "max_per_class_per_shard": max_per_class_per_shard,
+            "input_files": [str(path) for path in parquet_paths],
+            "generators_filter": generators,
+        },
+        "model": detector.model_info(),
+        "metrics": metrics.as_dict(),
+        "by_generator": group_prediction_rows(
+            rows, field="generator", threshold=0.5
+        ),
+        "by_source_shard": group_prediction_rows(
+            rows, field="source_shard", threshold=0.5
+        ),
+        "generator_vs_real": group_prediction_rows_against_reference(
+            rows,
+            field="generator",
+            reference_value="Real",
+            threshold=0.5,
+        ),
+        "predictions": rows,
+    }
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    # Exclusive creation protects an existing report, including a race
+    # where another process creates the file after the initial existence check.
+    try:
+        with output.open("x", encoding="utf-8", newline="\n") as handle:
+            json.dump(report, handle, indent=2, ensure_ascii=False, default=str)
+            handle.write("\n")
+    except FileExistsError as exc:
+        raise typer.BadParameter(
+            f"Output appeared during evaluation; refusing to overwrite: {output}"
+        ) from exc
+
+    console.print(f"Fixed-threshold report written to [bold]{output}[/bold]")
+    console.print(f"Samples evaluated: {len(samples)}")
+    console.print("Calibration disabled; global threshold = 0.5")
+
 @app.command("prepare-tiny-genimage")
 def prepare_tiny_genimage_command(
     output_dir: Path = typer.Argument(..., help="Output folder with real/ai subfolders."),

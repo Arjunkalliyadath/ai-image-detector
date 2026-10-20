@@ -134,6 +134,168 @@ def test_benchmark_tiny_genimage_local_writes_group_report(monkeypatch, tmp_path
     assert payload["groups"]["generator"]["SD14"]["accuracy"] == 1.0
     assert payload["dataset"]["kind"] == "tiny-genimage-local"
 
+
+@pytest.mark.parametrize(
+    "backend",
+    ["or-ensemble", "or-ensemble-high-recall"],
+)
+def test_fixed_tiny_genimage_writes_report(
+    monkeypatch, tmp_path, backend
+):
+    samples = [
+        ImageSample(
+            Image.new("RGB", (8, 8), "black"),
+            0,
+            sample_id="r1",
+            metadata={
+                "generator": "Real",
+                "source_shard": "shard-1.parquet",
+                "label_name": "real",
+            },
+        ),
+        ImageSample(
+            Image.new("RGB", (8, 8), "black"),
+            0,
+            sample_id="r2",
+            metadata={
+                "generator": "Real",
+                "source_shard": "shard-1.parquet",
+                "label_name": "real",
+            },
+        ),
+        ImageSample(
+            Image.new("RGB", (8, 8), "white"),
+            1,
+            sample_id="f1",
+            metadata={
+                "generator": "SD14",
+                "source_shard": "shard-1.parquet",
+                "label_name": "ai",
+            },
+        ),
+        ImageSample(
+            Image.new("RGB", (8, 8), "white"),
+            1,
+            sample_id="f2",
+            metadata={
+                "generator": "SD14",
+                "source_shard": "shard-1.parquet",
+                "label_name": "ai",
+            },
+        ),
+    ]
+
+    captured = {}
+
+    def fake_collect(paths, **kwargs):
+        captured["paths"] = paths
+        captured.update(kwargs)
+        return samples
+
+    def fake_create_detector(*args, **kwargs):
+        assert kwargs["threshold"] == 0.5
+        assert kwargs["backend"] == backend
+        return BrightnessDetector()
+
+    monkeypatch.setattr(
+        cli, "collect_tiny_genimage_parquet_samples", fake_collect
+    )
+    monkeypatch.setattr(cli, "create_detector", fake_create_detector)
+
+    parquet = tmp_path / "shard-1.parquet"
+    parquet.write_text("placeholder", encoding="utf-8")
+    output = tmp_path / "fixed-report.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark-tiny-genimage-fixed",
+            str(parquet),
+            "--backend",
+            backend,
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["max_per_class_per_shard"] == 25
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    evaluation = payload["evaluation"]
+
+    assert evaluation["threshold_calibration"] is False
+    assert evaluation["global_threshold"] == 0.5
+    assert evaluation["backend"] == backend
+    assert "not calibrated probabilities" in evaluation["score_interpretation"]
+    assert payload["metrics"]["threshold"] == 0.5
+    assert "SD14" in payload["by_generator"]
+    assert "shard-1.parquet" in payload["by_source_shard"]
+    assert "SD14" in payload["generator_vs_real"]
+
+
+def test_fixed_tiny_genimage_refuses_existing_report(
+    monkeypatch, tmp_path
+):
+    output = tmp_path / "existing-report.json"
+    original = '{"keep": "untouched"}'
+    output.write_text(original, encoding="utf-8")
+
+    parquet = tmp_path / "shard.parquet"
+    parquet.write_text("placeholder", encoding="utf-8")
+
+    def unexpected_collect(*args, **kwargs):
+        raise AssertionError("Existing output must be rejected before loading data")
+
+    monkeypatch.setattr(
+        cli, "collect_tiny_genimage_parquet_samples", unexpected_collect
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark-tiny-genimage-fixed",
+            str(parquet),
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "already exists" in result.output
+    assert output.read_text(encoding="utf-8") == original
+
+
+def test_fixed_tiny_genimage_rejects_unsupported_backend(
+    monkeypatch, tmp_path
+):
+    parquet = tmp_path / "shard.parquet"
+    parquet.write_text("placeholder", encoding="utf-8")
+
+    def unexpected_collect(*args, **kwargs):
+        raise AssertionError("Unsupported backend must be rejected before loading")
+
+    monkeypatch.setattr(
+        cli, "collect_tiny_genimage_parquet_samples", unexpected_collect
+    )
+
+    output = tmp_path / "report.json"
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark-tiny-genimage-fixed",
+            str(parquet),
+            "--backend",
+            "hf",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "or-ensemble" in result.output
+    assert not output.exists()
+
 def test_calibrated_ultra_preserves_zero_weight_and_threshold(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "aidetector.cli.create_detector",
